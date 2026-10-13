@@ -9,6 +9,30 @@
 
 **Java 21 · Spring Boot 3.5 · WebSocket · PostgreSQL 16 · Redis 7 · Micrometer/Prometheus/Grafana · Testcontainers · k6**
 
+> 문서 기준: 2026-10-13, 코드 커밋 `a59252f` (테스트 90개 통과, 장애 주입 3종·시나리오 스크립트 통과)
+
+---
+
+## 프로젝트 구조
+
+```
+src/main/java/com/example/chat
+├── api/          REST 컨트롤러, 세션 서비스, DTO
+├── ingest/       EventAppendService — 모든 이벤트의 단일 쓰기 경로 (락·중복·검증·seq·outbox)
+├── restore/      SessionReducer(순수 함수), SessionState, RestoreService, SnapshotService
+├── projection/   OutboxWorker(재시도/DLQ), MessageProjector(체크포인트, 스냅샷 자동화)
+├── realtime/     WebSocket 핸들러, EventDelivery(재정렬/gap-fill), Redis 버스, presence, sweeper
+├── store/        JdbcTemplate 리포지토리 (핫패스 SQL)
+├── domain/       EventType, ParticipantState(상태 머신), SessionStatus
+├── admin/        DLQ / projection 재구축 / chaos API
+└── config/       설정, 메트릭, WebSocket/Redis/OpenAPI
+scripts/          smoke.sh, ws-scenario.mjs, seed.mjs, chaos/*.mjs, lib/chat-client.mjs
+loadtest/         k6 스크립트, results/
+infra/            nginx, prometheus, grafana(대시보드 프로비저닝)
+docs/             설계 문서
+plan.md           설계 요약 (한 문서로 보기)
+```
+
 ---
 
 ## 빠른 시작
@@ -106,7 +130,7 @@ k6 run loadtest/read-paths.js                              # timeline / messages
 | 관측 가능성 | JSON 구조화 로그, traceId (HTTP 자동 + WS 프레임별 span + Redis 메시지 전파) |
 | 테스트 고도화 | 단위 73 + Testcontainers 통합 17, 결정성 property 테스트, 장애 주입 스크립트 3종 + chaos API |
 | 추가 통신 방식 검토 | WebSocket/SSE/Long Polling/WebRTC 비교 + WebRTC 공존 설계 (문서) |
-| 기타 | 브라우저 테스트 클라이언트 (`/`, 입력 중 표시는 상태가 바뀔 때만 전송: 입력 시작·삭제 시작·전송), 세션 생성 `Idempotency-Key`, 정합성 점검 SQL |
+| 기타 | 브라우저 테스트 클라이언트 (`/`: 송수신, 끊기/재연결, 중복 재전송, 입력 중 표시(상태가 바뀔 때만 전송), **시점 복원 결과를 대화창에 표시**), 세션 생성 `Idempotency-Key`, 정합성 점검 SQL |
 
 ### 문서로만 대체한 항목
 
@@ -128,7 +152,7 @@ k6 run loadtest/read-paths.js                              # timeline / messages
 | [docs/db-design.md](docs/db-design.md) | ERD, 핵심 DDL, 인덱스 근거, 정규화/비정규화/JSONB 트레이드오프, 데이터 증가 대응 |
 | [docs/query-optimization.md](docs/query-optimization.md) | 핫패스 쿼리 3개 (SQL, 인덱스, EXPLAIN 실측, 병목/개선) + **부하 테스트 트러블슈팅 기록** |
 | [docs/incident-response.md](docs/incident-response.md) | 서버 다운 / DB 장애 / 정합성 이슈: 감지 → 완화 → 복구, 정합성 점검 SQL |
-| [docs/load-test-results.md](docs/load-test-results.md) | k6 측정 결과와 개선 전후 비교 |
+| [docs/load-test-results.md](docs/load-test-results.md) | k6 측정 결과와 개선 전후 비교, 최종 코드 재측정과 지연 원인 조사 |
 | [docs/websocket-protocol.md](docs/websocket-protocol.md) | WS 프레임, 오류 코드, 클라이언트 정합성 계약 |
 | [docs/openapi.yaml](docs/openapi.yaml) | OpenAPI 3.1 명세 |
 | [docs/webrtc-comparison.md](docs/webrtc-comparison.md) | 통신 방식 비교 |
@@ -146,7 +170,9 @@ k6 run loadtest/read-paths.js                              # timeline / messages
 | GET | `/sessions/{id}/messages?beforeSeq=&limit=` | 대화창 (read model) |
 | GET | `/sessions/{id}/timeline?at=\|seq=&limit=&verify=` | **특정 시점 상태 복원** |
 | POST / GET | `/sessions/{id}/snapshots` | 스냅샷 생성 / 목록 |
-| GET / POST | `/admin/dlq`, `/admin/dlq/requeue`, `/admin/projections/{id}/rebuild`, `/admin/chaos` | 운영 |
+| GET | `/admin/dlq` | DLQ 조회 |
+| POST | `/admin/dlq/requeue` · `/admin/projections/{id}/rebuild` | DLQ 재처리 / projection 재구축 |
+| GET / PUT | `/admin/chaos` | 장애 주입 설정 조회 / 변경 (변경은 `CHAOS_ENABLED=true`일 때만) |
 | WS | `/ws?sessionId=&userId=&lastSeq=` | 실시간 |
 
 ## 주요 의사결정 요약
@@ -167,22 +193,3 @@ k6 run loadtest/read-paths.js                              # timeline / messages
 - 메시지 ID = MESSAGE 이벤트의 `clientEventId`
 - typing indicator는 휘발성 신호로 저장/복원하지 않음
 - 시점 복원의 기준 시각은 **서버 수신 시각**
-
-## 프로젝트 구조
-
-```
-src/main/java/com/example/chat
-├── api/          REST 컨트롤러, 세션 서비스, DTO
-├── ingest/       EventAppendService — 모든 이벤트의 단일 쓰기 경로 (락·중복·검증·seq·outbox)
-├── restore/      SessionReducer(순수 함수), SessionState, RestoreService, SnapshotService
-├── projection/   OutboxWorker(재시도/DLQ), MessageProjector(체크포인트, 스냅샷 자동화)
-├── realtime/     WebSocket 핸들러, EventDelivery(재정렬/gap-fill), Redis 버스, presence, sweeper
-├── store/        JdbcTemplate 리포지토리 (핫패스 SQL)
-├── domain/       EventType, ParticipantState(상태 머신), SessionStatus
-├── admin/        DLQ / projection 재구축 / chaos API
-└── config/       설정, 메트릭, WebSocket/Redis/OpenAPI
-scripts/          smoke.sh, ws-scenario.mjs, seed.mjs, chaos/*.mjs, lib/chat-client.mjs
-loadtest/         k6 스크립트, results/
-infra/            nginx, prometheus, grafana(대시보드 프로비저닝)
-docs/             설계 문서
-```

@@ -4,6 +4,8 @@
 
 이 문서는 전체 설계를 한곳에 요약한다. 절마다 상세 문서를 링크했다.
 
+> 문서 기준: 2026-10-13, 코드 커밋 `a59252f`. 실행 방법과 테스트 목록은 [README.md](README.md)에 있다.
+
 ---
 
 ## 1. 목표와 범위
@@ -261,10 +263,14 @@ cutoffSeq --(PK 역방향 1건)--> seq ≤ cutoffSeq 인 가장 최근 스냅샷
 | GET | `/sessions/{id}/messages?beforeSeq=&limit=` | 대화창 (read model) |
 | GET | `/sessions/{id}/timeline?at=\|seq=&limit=&verify=` | **특정 시점 상태 복원** |
 | POST / GET | `/sessions/{id}/snapshots` | 스냅샷 생성 / 목록 |
-| GET / POST | `/admin/dlq`, `/admin/dlq/requeue`, `/admin/projections/{id}/rebuild`, `/admin/chaos` | 운영 |
+| GET | `/admin/dlq` | DLQ 조회 |
+| POST | `/admin/dlq/requeue` · `/admin/projections/{id}/rebuild` | DLQ 재처리 / projection 재구축 |
+| GET / PUT | `/admin/chaos` | 장애 주입 설정 조회 / 변경 (변경은 `CHAOS_ENABLED=true`일 때만) |
 | WS | `/ws?sessionId=&userId=&lastSeq=` | 실시간 |
 
 명세: [openapi.yaml](docs/openapi.yaml), Swagger UI `http://localhost:8080/swagger-ui.html`
+
+브라우저 테스트 클라이언트(`http://localhost:8080/`)로 송수신, 끊기/재연결, 중복 재전송, 입력 중 표시, 시점 복원(결과를 대화창에 표시)을 수동으로 확인할 수 있다.
 
 ---
 

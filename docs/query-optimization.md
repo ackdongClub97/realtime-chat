@@ -172,5 +172,5 @@ Limit (rows=51)
 ### 남은 한계 (측정 기준)
 
 - **처리량 상한:** 이 환경에서 초당 약 1,850건이 포화점이다. 이때 ack p95는 약 200ms이고, 병목은 PostgreSQL commit 처리량(커넥션 대기)이다.
-- **정상 구간:** 초당 940건(500명)에서는 ack/e2e p95가 모두 4ms다.
+- **정상 구간:** 초당 940건(500명)에서는 ack/e2e p95가 모두 4ms였다(1회 측정). 워밍업 후 반복 측정한 정상 범위는 ack p95 5~9ms다([load-test-results.md 4절](load-test-results.md)).
 - **수평 확장 방향:** 앱 인스턴스는 무상태라 늘리면 되지만, 쓰기는 단일 PostgreSQL에 모인다. 다음 단계는 `session_id` 해시 샤딩(db-design.md 6절)이다.

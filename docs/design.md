@@ -78,7 +78,7 @@ flowchart LR
 재연결: ws /ws?sessionId&userId&lastSeq=41
 
 서버:
- 1. 참여자 검증
+ 1. 참여자 검증, lastSeq 검증 (숫자 아님·음수 → close 4400, 서버 최신 seq보다 큼 → close 4422)
  2. welcome{serverLastSeq:57, resumeFrom:41}
  3. 레지스트리 등록 (지금부터 live 이벤트 수신 시작)
  4. presence ONLINE, 다른 인스턴스의 이전 연결 KICK (사용자당 1연결)

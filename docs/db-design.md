@@ -18,18 +18,22 @@ Write model을 동기로 갱신하는 이유는 **검증에 필요한 상태**�
 
 ## 2. ERD
 
+실선은 DDL에 실제로 걸린 FK(`REFERENCES chat_session (id)`), 점선은 FK 없이 컬럼 값으로만 이어지는 논리적 관계다. 사용자 테이블은 없고 `user_id`는 문자열로만 저장한다.
+
 ```mermaid
 erDiagram
-    chat_session ||--o{ participant : "참여자 (현재 상태)"
-    chat_session ||--o{ event : "이벤트 원장 (append-only)"
-    chat_session ||--o{ session_snapshot : "seq 시점 상태"
-    chat_session ||--o{ message_projection : "대화창 read model"
-    chat_session ||--o{ projection_offset : "projection 체크포인트"
-    event ||--o| outbox : "같은 트랜잭션에 기록"
-    outbox ||--o| dead_letter : "재시도 초과 시 이동"
+    chat_session ||--o{ participant : "FK session_id"
+    chat_session ||--o{ event : "FK session_id (append-only)"
+    chat_session ||--o{ session_snapshot : "FK session_id"
+    chat_session ||..o{ message_projection : "session_id (FK 없음)"
+    chat_session ||..o{ projection_offset : "session_id (FK 없음)"
+    event ||..o| message_projection : "client_event_id = message_id"
+    event ||..o| outbox : "seq = event_seq (처리 후 삭제)"
+    outbox ||..o| dead_letter : "재시도 초과 시 이동"
 
     chat_session {
         uuid id PK
+        varchar title
         varchar status "ACTIVE|INTERRUPTED|ENDED"
         varchar created_by
         timestamptz created_at
@@ -44,7 +48,7 @@ erDiagram
         varchar state "JOINED|DISCONNECTED|LEFT"
         timestamptz joined_at
         timestamptz left_at
-        bigint last_event_seq
+        bigint last_event_seq "상태를 마지막으로 바꾼 이벤트"
     }
     event {
         uuid session_id PK,FK
@@ -62,14 +66,17 @@ erDiagram
         bigint seq PK
         int schema_version
         jsonb state
+        timestamptz created_at
     }
     message_projection {
         uuid session_id PK
         varchar message_id PK "= MESSAGE.client_event_id"
-        bigint seq UK
+        bigint seq UK "session_id와 복합"
         varchar sender_id
         text content
         varchar status "SENT|EDITED|DELETED"
+        timestamptz created_at
+        timestamptz updated_at
         bigint updated_seq "재적용 방지"
     }
     projection_offset {
@@ -77,6 +84,7 @@ erDiagram
         varchar projection PK
         bigint last_applied_seq
         bigint last_snapshot_seq
+        timestamptz updated_at
     }
     outbox {
         bigserial id PK
@@ -85,17 +93,30 @@ erDiagram
         varchar status "PENDING|PROCESSING"
         int attempts
         timestamptz next_attempt_at "지수 백오프"
+        varchar locked_by
         timestamptz locked_until "리스"
+        text last_error
+        timestamptz created_at
     }
     dead_letter {
         bigserial id PK
-        bigint outbox_id
+        bigint outbox_id "옮겨진 outbox 행 id (원래 행은 삭제됨)"
         uuid session_id
         bigint event_seq
+        int attempts
         text last_error
+        timestamptz failed_at
         timestamptz requeued_at
     }
 ```
+
+| 관계 | FK | 비고 |
+|---|---|---|
+| `participant`, `event`, `session_snapshot` → `chat_session` | ✓ | 세션 1 : N |
+| `message_projection`, `projection_offset` → `chat_session` | ✗ | 원장에서 다시 만들 수 있는 파생 데이터라 FK를 두지 않았다 |
+| `message_projection.message_id` → `event.client_event_id` | ✗ | MESSAGE 이벤트 1건 = 메시지 1행. 수정·삭제 이벤트가 같은 행을 갱신 |
+| `outbox.(session_id, event_seq)` → `event.(session_id, seq)` | ✗ | 같은 트랜잭션(CTE)에서 생성, 처리 후 삭제 |
+| `dead_letter.outbox_id` → `outbox.id` | ✗ | 옮길 때 outbox 행이 삭제되고, requeue하면 새 outbox 행이 생기므로 FK를 걸 수 없다 |
 
 ## 3. 핵심 DDL
 
@@ -175,6 +196,9 @@ CREATE UNIQUE INDEX idx_msgproj_session_seq ON message_projection (session_id, s
 | **세션 목록** | `chat_session (status, created_at DESC, id DESC)`, `(created_at DESC, id DESC)` | 필터 + 정렬 키 순서가 인덱스와 일치 → keyset 페이지네이션, OFFSET 없음 |
 | **내 세션 목록** | `participant (user_id, session_id)` | 사용자 → 세션 (자세한 내용과 한계는 query-optimization.md 참고) |
 | **outbox 폴링** | 부분 인덱스 `(next_attempt_at, id) WHERE status='PENDING'` | 처리 대상만 인덱싱 → 대기열이 커져도 작은 인덱스를 순서대로 읽음 |
+| **outbox 리스 회수** (워커 크래시) | 부분 인덱스 `(locked_until) WHERE status='PROCESSING'` | 처리 중인 행만 인덱싱 → 만료된 리스를 빠르게 찾음 |
+| **outbox 세션 정리** (따라잡기 후) | `(session_id, event_seq)` | `event_seq <= applied`인 행을 한 번에 삭제(coalescing) |
+| **DLQ 조회 / requeue** | 부분 인덱스 `(failed_at) WHERE requeued_at IS NULL` | 미처리 항목만 인덱싱 |
 
 **의도적으로 만들지 않은 인덱스**
 

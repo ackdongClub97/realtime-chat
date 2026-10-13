@@ -69,6 +69,7 @@
 | `IDEMPOTENCY_KEY_REUSED` | 같은 clientEventId로 다른 내용을 보냄 | 클라이언트 버그. 새 ID를 발급 |
 | `NOT_PARTICIPANT` / `NOT_MESSAGE_OWNER` | 권한 없음 | 재시도하지 않음 |
 | `SESSION_ENDED` | 종료된 세션 | 재시도하지 않음 |
+| `INVALID_FRAME` / `UNKNOWN_FRAME` / `INVALID_EVENT_TYPE` | 잘못된 JSON, 알 수 없는 프레임 타입, `send`로 보낼 수 없는 eventType | 클라이언트 버그. 재시도하지 않음 |
 
 ### Close code
 

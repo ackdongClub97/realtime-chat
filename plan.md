@@ -50,7 +50,7 @@
 | 1 | **진실의 원천은 `event` 테이블 하나** | 참여자·상태·대화창·스냅샷이 모두 원장에서 다시 만들어지는 파생 데이터가 된다. 복원과 장애 복구가 단순해진다 | 원장이 계속 커진다 (아카이빙 필요) |
 | 2 | **seq는 세션 행 락 아래 카운터로 발급** | 시퀀스 객체(롤백 시 구멍)나 `max+1`(경합) 대신 gap-free를 보장한다. 구멍이 있으면 "누락"으로 판정할 수 있다 | 세션 단위로 쓰기가 직렬화된다. 1:1 대화에선 무시할 수준 |
 | 3 | **순서 역전은 서버가 거절하고 클라이언트가 재시도** | 원본보다 먼저 온 수정은 422 retryable. 원장에는 인과 순서가 지켜진 이벤트만 존재한다 | 클라이언트가 재시도 규칙을 지켜야 한다 |
-| 4 | **실시간 팬아웃은 at-most-once (Redis), 정합성은 원장이 책임** | 유실은 재정렬 버퍼 → gap-fill → resume으로 원장에서 복구한다. 그래서 Kafka 없이 충분하다 | Redis 장애 시 다른 인스턴스 사용자는 복구까지 실시간 수신이 지연된다 |
+| 4 | **실시간 팬아웃은 at-most-once (Redis), 정합성은 원장이 책임** | 유실은 재정렬 버퍼 → gap-fill → resume으로 원장에서 복구한다. 그래서 Kafka 없이 충분하다 | Redis 장애 시 다른 인스턴스 사용자는 ping 주기(참고 구현 5~10초)만큼 늦게 받는다 |
 | 5 | **Transactional Outbox** | 이벤트 저장과 비동기 작업 등록을 한 트랜잭션으로 묶어 부분 실패를 없앤다 | DB 폴링 비용 |
 | 6 | **스냅샷은 정확한 경계(seq % 100 == 0)에서** | 스냅샷 생성이 따라잡은 경우 어떤 시점이든 리플레이가 최대 99건이다 | 스냅샷 저장 공간. 생성이 비동기라 지연 시 리플레이가 길어진다(정확성은 유지) |
 | 7 | **Reducer는 순수 함수** | 같은 이벤트 → 항상 같은 상태. 스냅샷 경로와 전체 리플레이를 언제든 대조할 수 있다(`verify=true`) | 시각·난수·DB를 reducer 안에서 쓸 수 없다 |
@@ -118,8 +118,8 @@ src/main/java/com/example/chat
 |---|---|---|---|
 | `SESSION_CREATED` | `POST /sessions` | `title` | ✓ |
 | `JOIN` / `LEAVE` | REST API, WS `leave` 프레임 | - | ✓ |
-| `DISCONNECT` | 서버 (비정상 연결 종료, 장애 인스턴스 정리) | `reason`, `connId` | ✓ |
-| `RECONNECT` | 서버 (DISCONNECTED 상태에서 재연결) | `connId` | ✓ |
+| `DISCONNECT` | 서버 (비정상 연결 종료, 장애 인스턴스 정리) | `reason`(`ws_closed` / `instance_down`), `connId` | ✓ |
+| `RECONNECT` | 서버 (DISCONNECTED 상태에서 재연결, 잘못 기록된 DISCONNECT 자가 치유) | `connId` (자가 치유 시 `reason: self_heal`) | ✓ |
 | `MESSAGE` | 클라이언트 | `text` | ✓ |
 | `MESSAGE_EDITED` / `MESSAGE_DELETED` | 클라이언트 (작성자 본인만) | `messageId`, (`text`) | ✓ |
 | `READ` | 클라이언트 | `upToSeq` | ✓ |
@@ -178,7 +178,7 @@ DISCONNECTED   --RECONNECT-->   JOINED
 | **서버 seq** | ✓ | 세션 행 락 아래에서 발급, 중복·구멍 없음 |
 
 - 수신 시각은 `GREATEST(DB clock_timestamp(), 직전 이벤트 시각)`으로 seq와 같은 방향으로 증가시킨다. 그래서 "시각 t까지의 상태"와 "seq ≤ k까지의 상태"가 같은 집합이 된다.
-- 원본보다 수정/삭제가 먼저 도착하면 `422 TARGET_NOT_FOUND (retryable)`. 클라이언트는 원본 ack 후 같은 ID로 재시도한다. 서버에 보류 큐를 두지 않은 이유는, 원본이 영영 오지 않을 수 있어 보류 항목의 수명 정책이 따로 필요해지기 때문이다.
+- 원본보다 수정/삭제가 먼저 도착하면 `422 TARGET_NOT_FOUND (retryable)`. 클라이언트는 원본 ack 후 같은 ID로 재시도하되, 최대 3회까지만 한다. 원본이 거절됐거나 상한을 넘으면 그 수정/삭제를 실패로 처리하고 버린다(무한 재시도 방지). 서버에 보류 큐를 두지 않은 이유는, 원본이 영영 오지 않을 수 있어 보류 항목의 수명 정책이 따로 필요해지기 때문이다.
 
 ### 5.3 실시간 전달과 재연결
 
@@ -194,7 +194,7 @@ DISCONNECTED   --RECONNECT-->   JOINED
 
 gap-fill은 다음 이벤트가 와야 동작한다. 그래서 조용한 대화에서 **마지막 이벤트**가 유실되면 발견할 수 없다. 이를 위해 클라이언트는 주기적으로 `ping`을 보내고, 서버는 ping마다 원장의 최신 seq와 그 연결에 보낸 seq를 비교해 빠진 이벤트를 먼저 보낸 뒤 `pong{serverLastSeq}`로 답한다.
 
-재연결 시 `lastSeq`가 숫자가 아니거나 음수면 close 4400, 서버의 최신 seq보다 크면(다른 세션의 상태, 원장 롤백) close 4422로 거절한다. 조용히 낮춰 받으면 클라이언트가 그 사이 이벤트를 "이미 받음"으로 버려 유실되기 때문이다.
+재연결 시 `lastSeq`가 숫자가 아니거나 음수면 close 4400, 서버의 최신 seq보다 크면(다른 세션의 상태, 원장 롤백) close 4422로 거절한다. 조용히 낮춰 받으면 클라이언트가 그 사이 이벤트를 "이미 받음"으로 버려 유실되기 때문이다. 4422를 받은 클라이언트는 로컬 상태를 버리고 `lastSeq=0`으로 다시 연결한다. 세션을 바꿀 때도 같은 이유로 로컬 상태를 버린다.
 
 결과적으로 클라이언트는 resume 중이든, Redis가 메시지를 잃든, 인스턴스가 바뀌든 **구멍과 중복이 없는 seq 순 스트림**을 받는다.
 
@@ -270,11 +270,11 @@ cutoffSeq --(PK 역방향 1건)--> seq ≤ cutoffSeq 인 가장 최근 스냅샷
 | GET | `/admin/dlq` | DLQ 조회 |
 | POST | `/admin/dlq/requeue` · `/admin/projections/{id}/rebuild` | DLQ 재처리 / projection 재구축 |
 | GET / PUT | `/admin/chaos` | 장애 주입 설정 조회 / 변경 (변경은 `CHAOS_ENABLED=true`일 때만) |
-| WS | `/ws?sessionId=&userId=&lastSeq=` | 실시간 |
+| WS | `/ws?sessionId=&userId=&lastSeq=` | 실시간. 잘못된 `lastSeq`는 close 4400(형식) / 4422(서버보다 앞섬) |
 
 명세: [openapi.yaml](docs/openapi.yaml), Swagger UI `http://localhost:8080/swagger-ui.html`
 
-브라우저 테스트 클라이언트(`http://localhost:8080/`)로 송수신, 끊기/재연결, 중복 재전송, 입력 중 표시, 시점 복원(결과를 대화창에 표시)을 수동으로 확인할 수 있다.
+브라우저 테스트 클라이언트(`http://localhost:8080/`)로 송수신, 끊기/재연결, 중복 재전송, 입력 중 표시, 시점 복원(결과를 대화창에 표시)을 수동으로 확인할 수 있다. 프로토콜 규칙대로 5초마다 ping을 보내고, 세션을 바꾸면 seq와 메시지를 초기화한다.
 
 ---
 
@@ -311,7 +311,7 @@ cutoffSeq --(PK 역방향 1건)--> seq ≤ cutoffSeq 인 가장 최근 스냅샷
 
 - **로그:** logstash JSON. MDC의 `traceId`, `sessionId`, `userId`, `connId`가 필드로 출력된다.
 - **추적:** HTTP는 자동, WebSocket 프레임은 프레임마다 span을 수동으로 연다. Redis 버스 메시지에 `traceId`를 실어 인스턴스를 넘어 이어진다. 오류 응답 본문에도 `traceId`를 넣는다.
-- **메트릭:** append 지연, 중복·거절률, 연결 수, 재정렬·gap-fill, outbox backlog와 projection 지연, DLQ, 복원 지연과 리플레이 길이, 장애 인스턴스 정리 등 도메인 메트릭 20종. Grafana 대시보드 15패널이 자동 프로비저닝된다.
+- **메트릭:** append 지연, 중복·거절률, 연결 수, 재정렬·gap-fill(ping 복구 포함), outbox backlog와 projection 지연, DLQ, 복원 지연과 리플레이 길이, 장애 인스턴스 정리 등 도메인 메트릭 20종. Grafana 대시보드 15패널이 자동 프로비저닝된다.
 
 상세: [design.md §6](docs/design.md)
 
@@ -325,7 +325,7 @@ cutoffSeq --(PK 역방향 1건)--> seq ≤ cutoffSeq 인 가장 최근 스냅샷
 | 통합 테스트 23개 (Testcontainers) | 32 스레드 동시 재전송 → 1건 저장, 200건 동시 append → seq gap-free, 거절·NOOP·중복 이벤트의 seq 미소비(실제 DB 롤백), 조용한 유실의 ping 복구, `lastSeq` 검증, 시점 복원 API, 스냅샷 경계, poison → DLQ → requeue, WS resume, 끊김 → 재연결 상태 전이 | 통과 |
 | 시나리오 스크립트 | `smoke.sh` (REST), `ws-scenario.mjs` (서로 다른 인스턴스 간 22개 검사) | 통과 |
 | 장애 주입 3종 | 인스턴스 SIGKILL, Redis 중단, DB 일시 정지 | 통과 |
-| 부하 테스트 (k6) | WS 500명 초당 ~1,000건: ack p95 5~9ms(워밍업 후), seq_gap 0. 포화(초당 ~1,850건)에서도 정합성 유지 | [load-test-results.md](docs/load-test-results.md) |
+| 부하 테스트 (k6) | WS 500명 초당 ~1,000건: ack p95 5~9ms(워밍업 후), seq_gap 0. 포화(초당 ~1,850건)에서도 정합성 유지. ping 처리 변경(`64b64bb`) 이전 코드 기준 | [load-test-results.md](docs/load-test-results.md) |
 
 ```bash
 ./gradlew test                          # 단위 73 + 통합 23 = 96개
@@ -347,6 +347,8 @@ node scripts/chaos/instance-down.mjs    # redis-down.mjs, db-pause.mjs
 | 인증 없음 (개발·검증 전용 구성) | 세션 ID만 알면 원장·복원 조회 가능. 관리자 API, Grafana도 인증 없음 | 인증 도입, 원장 조회와 삭제 이전 시점 복원은 감사 권한으로 제한, 관리 도구는 내부망 전용 ([README 보안 주의](README.md)) |
 | 삭제된 원문이 원장에 남음 | 개인정보 삭제 요청에 대응 불가 | crypto-shredding ([event-sourcing.md §3](docs/event-sourcing.md)) |
 | 인스턴스 장애 감지 최대 약 25초 | 그동안 상대방은 끊김을 모름 | 하트비트 TTL·sweep 주기 단축 (오탐과 트레이드오프) |
+| ping마다 DB 단건 조회 1회 | 연결 500개, 5~10초 주기면 초당 50~100건 (부하 테스트 미반영) | 세션 `last_seq`를 Redis에 캐시하거나, 마지막 이벤트 이후 일정 시간 동안만 비교 |
+| 조용한 유실 복구가 클라이언트 ping에 의존 | ping을 보내지 않는 클라이언트는 다음 이벤트·재연결 때까지 모름 | 서버 측 주기 점검(연결별 `lastSentSeq`와 세션 `last_seq` 비교) |
 
 ---
 

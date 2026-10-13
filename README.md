@@ -98,6 +98,7 @@ node scripts/chaos/db-pause.mjs        # DB 무응답 → 5s 후 retryable 오�
 
 k6 run -e SESSIONS=250 -e RATE_MS=500 loadtest/ws-chat.js   # WS 500명, 초당 ~1,000건
 k6 run loadtest/read-paths.js                              # timeline / messages / list
+# 기록된 부하 테스트 수치는 ping 처리 변경(64b64bb) 이전 코드 기준 (docs/load-test-results.md)
 ```
 
 ---
@@ -125,12 +126,12 @@ k6 run loadtest/read-paths.js                              # timeline / messages
 | Projection 비동기 파이프라인 | Transactional Outbox → 다중 인스턴스 워커 (`SKIP LOCKED` + 리스), 지수 백오프 + jitter, DLQ + requeue, 체크포인트 기반 멱등 적용, projection 재구축 API |
 | 재연결 resume / replay 고도화 | `lastSeq` resume(잘못된 `lastSeq`는 4400/4422로 거절), 서버 측 재정렬 버퍼 + 원장 gap-fill, ping 시 원장 비교로 조용한 유실 복구, 사용자당 1연결(인스턴스 간 KICK), presence 소유권(CAS) + 오탐 자가 치유 |
 | 수평 확장 | 앱 2대 + Nginx(sticky 없음) + Redis Pub/Sub 팬아웃, 장애 인스턴스 자동 감지/정리(sweeper) |
-| 부하 테스트 / 성능 측정 | k6 2종, 병목 진단 → 5단계 개선 기록 ([결과](docs/load-test-results.md)) |
+| 부하 테스트 / 성능 측정 | k6 2종, 병목 진단 → 5단계 개선 기록 ([결과](docs/load-test-results.md)). 수치는 ping 처리 변경(`64b64bb`) 이전 코드 기준 |
 | 운영 대시보드 | Grafana 자동 프로비저닝 대시보드 15패널, 도메인 메트릭 20종 |
 | 관측 가능성 | JSON 구조화 로그, traceId (HTTP 자동 + WS 프레임별 span + Redis 메시지 전파) |
 | 테스트 고도화 | 단위 73 + Testcontainers 통합 23, 결정성 property 테스트, 장애 주입 스크립트 3종 + chaos API |
 | 추가 통신 방식 검토 | WebSocket/SSE/Long Polling/WebRTC 비교 + WebRTC 공존 설계 (문서) |
-| 기타 | 브라우저 테스트 클라이언트 (`/`: 송수신, 끊기/재연결, 중복 재전송, 입력 중 표시(상태가 바뀔 때만 전송), **시점 복원 결과를 대화창에 표시**), 세션 생성 `Idempotency-Key`, 정합성 점검 SQL |
+| 기타 | 브라우저 테스트 클라이언트 (`/`: 송수신, 끊기/재연결, 중복 재전송, 입력 중 표시(상태가 바뀔 때만 전송), **시점 복원 결과를 대화창에 표시**, 세션 변경 시 seq·메시지 초기화, 5초 주기 ping), 세션 생성 `Idempotency-Key`, 정합성 점검 SQL |
 
 ### 문서로만 대체한 항목
 
@@ -186,14 +187,14 @@ k6 run loadtest/read-paths.js                              # timeline / messages
 | GET | `/admin/dlq` | DLQ 조회 |
 | POST | `/admin/dlq/requeue` · `/admin/projections/{id}/rebuild` | DLQ 재처리 / projection 재구축 |
 | GET / PUT | `/admin/chaos` | 장애 주입 설정 조회 / 변경 (변경은 `CHAOS_ENABLED=true`일 때만) |
-| WS | `/ws?sessionId=&userId=&lastSeq=` | 실시간 |
+| WS | `/ws?sessionId=&userId=&lastSeq=` | 실시간. 잘못된 `lastSeq`는 close 4400(형식) / 4422(서버보다 앞섬) |
 
 ## 주요 의사결정 요약
 
 1. **진실의 원천은 `event` 테이블 하나.** participant/status(동기), message_projection/snapshot(비동기)은 모두 원장에서 재생성 가능한 파생 데이터.
 2. **seq는 세션 행 락 아래의 카운터로 발급.** 시퀀스 객체(롤백 시 gap)나 `max+1`(경합) 대신 gap-free를 택함. 저장하지 않는 경우는 롤백해 seq를 되돌림. 대가는 세션 단위 직렬화 — 1:1 대화에선 무시할 수준.
 3. **순서 역전은 서버에서 거절하고 클라이언트가 재시도** (원본보다 먼저 온 수정 → 422 retryable). 원장에는 인과 순서가 지켜진 이벤트만 존재.
-4. **실시간 팬아웃은 at-most-once(Redis), 정합성은 원장이 책임.** 유실은 재정렬 버퍼 → gap-fill → resume으로 복구. 그래서 Redis는 Kafka 없이도 충분.
+4. **실시간 팬아웃은 at-most-once(Redis), 정합성은 원장이 책임.** 유실은 재정렬 버퍼 → gap-fill → ping 시 원장 비교 → resume으로 복구. 그래서 Redis는 Kafka 없이도 충분.
 5. **Transactional Outbox**로 이벤트 저장과 비동기 작업 등록을 원자화. outbox 행은 "세션에 새 이벤트 있음" 신호이며 실제 적용은 체크포인트 기반 → 중복/순서 무관 멱등.
 6. **스냅샷은 정확한 경계(seq % 100 == 0)에서**, 상태는 결정적 → 동시 생성도 `ON CONFLICT DO NOTHING`으로 안전. `verify=true`로 언제든 전체 리플레이와 대조.
 7. **성능보다 정합성.** `synchronous_commit=off` 같은 지연 개선책은 ack 후 유실 가능성 때문에 채택하지 않음.

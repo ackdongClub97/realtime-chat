@@ -106,7 +106,7 @@
 | **부분 실패** (저장은 됐는데 projection 미반영) | event + outbox 동일 트랜잭션 | `chat_outbox_oldest_age_seconds`, `projectedSeq < sessionLastSeq` | 자동 재시도 → DLQ → requeue |
 | **projection 오염 / 버그** | read model은 파생 데이터 | 원장 기반 복원과 projection 비교 | `POST /admin/projections/{id}/rebuild` |
 | **스냅샷 버그** | `schema_version`, 결정적 reducer | `timeline?verify=true` (스냅샷 경로 == 전체 리플레이) | 해당 버전 스냅샷 삭제 또는 버전 업 → 자동 재생성 |
-| **실시간 전송 유실** (Redis 유실, 인스턴스 장애) | 원장이 진실 | `chat_delivery_gap_filled_total` | 서버 gap-fill, 클라이언트 resume |
+| **실시간 전송 유실** (Redis 유실, 인스턴스 장애) | 원장이 진실 | `chat_delivery_gap_filled_total` | 서버 gap-fill, ping 시 원장 비교(조용한 유실), 클라이언트 resume |
 | **ack 전 서버 장애** | 클라이언트 재전송 + 멱등 | - | 같은 ID 재전송 → 1건만 저장 |
 | **원장 자체 유실** (디스크/운영 실수) | PostgreSQL WAL 아카이빙 + PITR, replica | 백업 검증 작업 | PITR 복원 → projection, 스냅샷 재구축 |
 

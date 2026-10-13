@@ -122,6 +122,7 @@ k6 run loadtest/read-paths.js                              # timeline / messages
 
 | 문서 | 내용 |
 |---|---|
+| [plan.md](plan.md) | **설계 요약** — 요구사항 매핑, 핵심 결정, 아키텍처, 도메인 모델, 주요 흐름, 검증 전략, 한계 (한 문서로 보기) |
 | [docs/design.md](docs/design.md) | 아키텍처, 기술 선택 근거, **중복 처리 · 순서 기준 · 재연결 정합성 · 수평 확장 · 비동기 처리 · 관측 가능성** |
 | [docs/event-sourcing.md](docs/event-sourcing.md) | 복원 전략(스냅샷+리플레이), 스냅샷 주기/포맷, reducer 결정성 규칙, 중복/역순 처리 |
 | [docs/db-design.md](docs/db-design.md) | ERD, 핵심 DDL, 인덱스 근거, 정규화/비정규화/JSONB 트레이드오프, 데이터 증가 대응 |

@@ -1,0 +1,97 @@
+# 전체 스택: 앱 2대(수평 확장) + Nginx(LB) + PostgreSQL + Redis + Prometheus + Grafana
+#   docker compose up -d --build
+# 로컬 개발(앱은 IDE/gradle 로 실행):
+#   docker compose up -d postgres redis
+name: realtime-chat
+
+x-app: &app
+  build: .
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  environment: &app-env
+    DB_URL: jdbc:postgresql://postgres:5432/chat
+    DB_USER: chat
+    DB_PASSWORD: chat
+    REDIS_HOST: redis
+    SPRING_PROFILES_ACTIVE: json
+    CHAOS_ENABLED: "true"
+  healthcheck:
+    test: ["CMD", "curl", "-fs", "http://localhost:8080/actuator/health/readiness"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: chat
+      POSTGRES_USER: chat
+      POSTGRES_PASSWORD: chat
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "max_connections=200"]
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chat -d chat"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app1:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app1
+    ports:
+      - "8081:8080"
+
+  app2:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app2
+    ports:
+      - "8082:8080"
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app1
+      - app2
+    ports:
+      - "8080:80"
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"

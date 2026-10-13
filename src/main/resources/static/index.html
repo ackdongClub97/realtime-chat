@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Realtime Chat 테스트 클라이언트</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 16px; background: #f6f7f9; color: #1d2330; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+  input, button { font: inherit; padding: 6px 10px; border: 1px solid #c8ccd4; border-radius: 6px; background: #fff; }
+  button { cursor: pointer; } button:hover { background: #eef1f6; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: #fff; border: 1px solid #e1e4ea; border-radius: 8px; padding: 12px; min-height: 360px; }
+  .log { height: 320px; overflow: auto; font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; }
+  .msg { padding: 4px 0; border-bottom: 1px solid #f0f2f5; }
+  .meta { color: #6b7385; font-size: 12px; }
+  .deleted { color: #9aa1af; font-style: italic; }
+  .past { background: #fff8e6; }
+</style>
+</head>
+<body>
+<h1>Realtime Chat 테스트 클라이언트</h1>
+<p class="meta">REST + WebSocket을 수동으로 확인하는 개발용 페이지입니다. 두 개의 브라우저 탭에서 각각 다른 사용자로 접속해 보세요.</p>
+<div class="row">
+  <input id="user" placeholder="userId" value="alice" size="10">
+  <input id="session" placeholder="sessionId" size="38">
+  <button id="create">세션 생성</button>
+  <button id="join">참여</button>
+  <button id="connect">연결</button>
+  <button id="disconnect">끊기</button>
+  <span id="status" class="meta">연결 안 됨</span>
+</div>
+<div class="row">
+  <input id="text" placeholder="메시지" size="40">
+  <button id="send">전송</button>
+  <button id="resend">마지막 메시지 재전송(중복)</button>
+  <button id="read">읽음 처리</button>
+  <input id="at" placeholder="복원 시각 (ISO-8601, 비우면 현재)" size="30">
+  <button id="timeline">시점 복원</button>
+</div>
+<div class="grid">
+  <div class="panel" id="chat"><b>대화</b> <span id="typing" class="meta"></span>
+    <div id="viewing" class="meta" hidden></div> <button id="live" hidden>현재로 돌아가기</button>
+    <div id="messages" class="log"></div></div>
+  <div class="panel"><b>프레임 로그</b><div id="log" class="log"></div></div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let ws = null, lastSeq = null, last = null, clientSeq = 0, typing = false;
+let viewing = null; // 시점 복원 결과를 보는 중이면 timeline 응답, 아니면 null (실시간)
+const messages = new Map();
+const log = (dir, obj) => { const el = $('log'); el.textContent += `${dir} ${JSON.stringify(obj)}\n`; el.scrollTop = el.scrollHeight; };
+const api = async (method, path, body) => {
+  const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json', 'X-User-Id': $('user').value }, body: body ? JSON.stringify(body) : undefined });
+  const json = await r.json().catch(() => null); log('HTTP', { method, path, status: r.status, body: json }); return json;
+};
+function render() {
+  // 복원 시점을 보는 동안에도 실시간 이벤트는 messages 에 계속 쌓이고, 돌아오면 그대로 보인다
+  const list = viewing ? viewing.messages : [...messages.values()];
+  $('chat').classList.toggle('past', !!viewing);
+  $('viewing').hidden = $('live').hidden = !viewing;
+  if (viewing) {
+    const who = viewing.participants.map((p) => `${p.userId} ${p.state}`).join(', ');
+    $('viewing').textContent = `${new Date(viewing.resolvedAt).toLocaleString('ko-KR')} 시점 (seq ${viewing.resolvedSeq}) · 세션 ${viewing.status} · ${who}`;
+  }
+  const el = $('messages'); el.innerHTML = '';
+  for (const m of [...list].sort((a, b) => a.seq - b.seq)) {
+    const div = document.createElement('div'); div.className = 'msg';
+    const text = m.status === 'DELETED' ? '(삭제된 메시지)' : m.text;
+    div.innerHTML = `<span class="meta">#${m.seq} ${m.senderId}${m.status === 'EDITED' ? ' (수정됨)' : ''}</span><br><span class="${m.status === 'DELETED' ? 'deleted' : ''}"></span>`;
+    div.lastChild.textContent = text; el.appendChild(div);
+  }
+  el.scrollTop = el.scrollHeight;
+}
+function onEvent(f) {
+  if (lastSeq !== null && f.seq <= lastSeq) return;
+  if (lastSeq !== null && f.seq > lastSeq + 1) { ws.send(JSON.stringify({ type: 'resume', lastSeq })); return; }
+  lastSeq = f.seq;
+  if (f.eventType === 'MESSAGE') messages.set(f.clientEventId, { seq: f.seq, senderId: f.userId, text: f.payload.text, status: 'SENT' });
+  if (f.eventType === 'MESSAGE_EDITED') { const m = messages.get(f.payload.messageId); if (m) { m.text = f.payload.text; m.status = 'EDITED'; } }
+  if (f.eventType === 'MESSAGE_DELETED') { const m = messages.get(f.payload.messageId); if (m) m.status = 'DELETED'; }
+  render();
+}
+$('create').onclick = async () => { const s = await api('POST', '/sessions', { title: 'browser test' }); if (s) $('session').value = s.id; };
+$('join').onclick = () => api('POST', `/sessions/${$('session').value}/join`);
+$('connect').onclick = () => {
+  const qs = new URLSearchParams({ sessionId: $('session').value, userId: $('user').value, lastSeq: lastSeq ?? 0 });
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?${qs}`);
+  ws.onopen = () => { $('status').textContent = '연결됨'; typing = false; setTyping($('text').value !== ''); };
+  ws.onclose = (e) => { $('status').textContent = `끊김 (${e.code} ${e.reason}) — 다시 연결하면 seq ${lastSeq} 이후부터 resume`; $('typing').textContent = ''; };
+  ws.onmessage = (m) => {
+    const f = JSON.parse(m.data); log('<=', f);
+    if (f.type === 'event') onEvent(f);
+    // 상대가 typing:false 를 보내거나 연결이 끊길(OFFLINE) 때까지 표시
+    if (f.type === 'typing') $('typing').textContent = f.typing ? `${f.userId} 입력 중…` : '';
+    if (f.type === 'presence' && f.status === 'OFFLINE') $('typing').textContent = '';
+  };
+};
+$('disconnect').onclick = () => ws && ws.close(3001);
+const send = (frame) => { log('=>', frame); ws.send(JSON.stringify(frame)); };
+$('send').onclick = () => {
+  last = { type: 'send', clientEventId: crypto.randomUUID(), eventType: 'MESSAGE', payload: { text: $('text').value }, clientSeq: ++clientSeq, clientTs: new Date().toISOString() };
+  send(last); $('text').value = ''; setTyping(false);
+};
+$('resend').onclick = () => last && send(last);
+$('read').onclick = () => lastSeq && send({ type: 'send', clientEventId: crypto.randomUUID(), eventType: 'READ', payload: { upToSeq: lastSeq } });
+// 입력 상태가 바뀔 때만 전송: 쓰기 시작 1번(true), 지우기 시작·전부 지움·전송 1번(false)
+const setTyping = (on) => {
+  if (on === typing || !ws || ws.readyState !== 1) return;
+  typing = on; send({ type: 'send', eventType: 'TYPING', payload: { typing: on } });
+};
+// 삭제 여부는 실제로 누른 키로 판단한다. 값/inputType 으로 추측하면 한글 IME 가 글자를 확정할 때마다
+// 내부적으로 보내는 deleteCompositionText 를 삭제로 오인한다. e.code 는 조합 중에도 물리 키를 알려준다.
+let deleteKey = false;
+$('text').onkeydown = (e) => { deleteKey = e.code === 'Backspace' || e.code === 'Delete'; };
+$('text').onkeyup = () => { deleteKey = false; };
+$('text').oninput = (e) => {
+  if (e.inputType === 'deleteCompositionText') return;
+  const deleting = deleteKey || e.inputType === 'deleteByCut' || e.inputType === 'deleteByDrag';
+  setTyping($('text').value !== '' && !deleting);
+};
+$('timeline').onclick = async () => {
+  const r = await api('GET', `/sessions/${$('session').value}/timeline?verify=true&limit=1000${$('at').value ? `&at=${encodeURIComponent($('at').value)}` : ''}`);
+  if (r?.messages) { viewing = r; render(); }
+};
+$('live').onclick = () => { viewing = null; render(); };
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+.gradle
+build
+.git
+docs
+loadtest
+scripts
+infra

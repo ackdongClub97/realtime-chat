@@ -1,0 +1,86 @@
+spring:
+  application:
+    name: realtime-chat
+  datasource:
+    # socketTimeout: DB 가 응답하지 않을 때(행, 네트워크 단절) 무한 대기 대신 5초 후 실패 → 재시도 가능 오류로 응답
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/chat}?socketTimeout=5&connectTimeout=3&tcpKeepAlive=true
+    username: ${DB_USER:chat}
+    password: ${DB_PASSWORD:chat}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      connection-timeout: 3000        # 커넥션 고갈 시 빠르게 실패 (무한 대기 방지)
+      leak-detection-threshold: 10000
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 1s
+  flyway:
+    enabled: true
+  task:
+    scheduling:
+      # 기본값(1)이면 outbox 폴링이 길어질 때 presence 하트비트가 밀려 살아있는 인스턴스가 "죽은 것"으로 판정된다
+      pool:
+        size: 4
+      thread-name-prefix: sched-
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+chat:
+  instance-id: ${INSTANCE_ID:}
+  snapshot:
+    interval: ${SNAPSHOT_INTERVAL:100}       # 이벤트 N개마다 스냅샷
+  outbox:
+    poll-interval-ms: 200
+    batch-size: 500
+    max-attempts: 5
+    base-backoff-ms: 500
+    max-backoff-ms: 60000
+    lease-seconds: 30
+    worker-threads: 4                      # 세션 단위 병렬 처리 (세션 내 순서는 체크포인트 락으로 보장)
+  presence:
+    ttl-seconds: 30
+    refresh-interval-ms: 10000
+    instance-heartbeat-ms: 3000
+    instance-ttl-seconds: 15
+    sweep-interval-ms: 5000
+  chaos:
+    enabled: ${CHAOS_ENABLED:false}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+  metrics:
+    tags:
+      instance: ${INSTANCE_ID:local}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        chat.append.latency: true
+        chat.restore.latency: true
+  tracing:
+    sampling:
+      probability: 1.0
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+  api-docs:
+    path: /v3/api-docs
+
+logging:
+  level:
+    com.example.chat: INFO

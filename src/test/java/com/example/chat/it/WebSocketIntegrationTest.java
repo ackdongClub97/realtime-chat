@@ -9,7 +9,13 @@ import java.util.concurrent.TimeUnit;
 import com.example.chat.api.SessionService;
 import com.example.chat.domain.EventType;
 import com.example.chat.domain.NewEvent;
+import com.example.chat.domain.ParticipantState;
+import com.example.chat.domain.SessionStatus;
+import com.example.chat.domain.StoredEvent;
 import com.example.chat.ingest.EventAppendService;
+import com.example.chat.restore.RestoreService;
+import com.example.chat.restore.SessionState;
+import com.example.chat.store.EventRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
@@ -34,6 +40,10 @@ class WebSocketIntegrationTest extends IntegrationTestBase {
     EventAppendService appender;
     @Autowired
     ObjectMapper mapper;
+    @Autowired
+    EventRepository events;
+    @Autowired
+    RestoreService restore;
 
     class Recorder extends TextWebSocketHandler {
         final List<JsonNode> frames = new CopyOnWriteArrayList<>();
@@ -109,6 +119,55 @@ class WebSocketIntegrationTest extends IntegrationTestBase {
 
         aliceWs.close();
         bobWs2.close();
+    }
+
+    @Test
+    void disconnectThenReconnectRecordsEventsAndRestoresActiveStatus() throws Exception {
+        UUID sid = sessions.create("alice", "ws", null).session().id();
+        appender.append(sid, new NewEvent("ja", EventType.JOIN, "alice", null, null, null), "it");
+        appender.append(sid, new NewEvent("jb", EventType.JOIN, "bob", null, null, null), "it");
+
+        Recorder alice = new Recorder();
+        WebSocketSession aliceWs = connect(alice, sid, "alice", 0L);
+        Recorder bob1 = new Recorder();
+        WebSocketSession bobWs = connect(bob1, sid, "bob", 0L);
+        assertThat(sessions.require(sid).status()).isEqualTo(SessionStatus.ACTIVE);
+
+        bobWs.close(new CloseStatus(3001)); // leave 프레임 없는 종료 = 비정상 끊김
+        EventStoreIntegrationTest.await(() -> hasEvent(alice, "DISCONNECT", "bob"));
+        assertThat(sessions.require(sid).status()).isEqualTo(SessionStatus.INTERRUPTED);
+        long disconnectSeq = sessions.require(sid).lastSeq();
+
+        Recorder bob2 = new Recorder();
+        WebSocketSession bobWs2 = connect(bob2, sid, "bob", bob1.eventSeqs().getLast());
+        EventStoreIntegrationTest.await(() -> hasEvent(alice, "RECONNECT", "bob"));
+        assertThat(sessions.require(sid).status()).isEqualTo(SessionStatus.ACTIVE);
+        long reconnectSeq = sessions.require(sid).lastSeq();
+
+        // 원장: bob 의 DISCONNECT, RECONNECT 가 순서대로 정확히 1건씩
+        List<StoredEvent> bobLifecycle = events.findRange(sid, 0, reconnectSeq, 100).stream()
+                .filter(e -> e.userId().equals("bob")
+                        && (e.type() == EventType.DISCONNECT || e.type() == EventType.RECONNECT))
+                .toList();
+        assertThat(bobLifecycle).extracting(StoredEvent::type)
+                .containsExactly(EventType.DISCONNECT, EventType.RECONNECT);
+        assertThat(bobLifecycle).extracting(StoredEvent::seq).containsExactly(disconnectSeq, reconnectSeq);
+
+        // 시점 복원도 같은 전이를 재현한다
+        SessionState atDisconnect = restore.restoreAtSeq(sid, disconnectSeq).state();
+        assertThat(atDisconnect.status).isEqualTo(SessionStatus.INTERRUPTED);
+        assertThat(atDisconnect.participants.get("bob").state).isEqualTo(ParticipantState.DISCONNECTED);
+        SessionState atReconnect = restore.restoreAtSeq(sid, reconnectSeq).state();
+        assertThat(atReconnect.status).isEqualTo(SessionStatus.ACTIVE);
+        assertThat(atReconnect.participants.get("bob").state).isEqualTo(ParticipantState.JOINED);
+
+        aliceWs.close();
+        bobWs2.close();
+    }
+
+    private static boolean hasEvent(Recorder r, String eventType, String userId) {
+        return r.frames.stream().anyMatch(f -> "event".equals(f.path("type").asText())
+                && eventType.equals(f.path("eventType").asText()) && userId.equals(f.path("userId").asText()));
     }
 
     @Test

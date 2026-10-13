@@ -42,7 +42,7 @@ docker compose up -d postgres redis
 ### 테스트
 
 ```bash
-./gradlew test             # 단위 73 + 통합 16 = 89개 (통합은 Testcontainers 로 실제 PostgreSQL/Redis 사용)
+./gradlew test             # 단위 73 + 통합 17 = 90개 (통합은 Testcontainers 로 실제 PostgreSQL/Redis 사용)
 ```
 
 **단위 테스트 (DB 없음, Mockito)**
@@ -63,7 +63,7 @@ docker compose up -d postgres redis
 |---|---|---|
 | `EventStoreIntegrationTest` | 8 | 32 스레드 동시 재전송 → 1건 저장 / 200건 동시 append → seq 1..N gap-free + 수신시각 단조 / 시점 복원 / 원본보다 먼저 온 수정 / 스냅샷 경계와 전 지점 일치 / poison → 재시도 → DLQ → requeue / 종료 세션 |
 | `TimelineApiIntegrationTest` | 6 | HTTP `timeline` API로 시점 t의 메시지·참여자·안 읽은 수 복원 / `at`과 같은 시각에 수신된 이벤트 포함 / 모든 seq에서 `verify` 통과 / 경계 입력·오류 응답(`NO_STATE_AT` 등) |
-| `WebSocketIntegrationTest` | 2 | 끊김 → 재연결 resume 시 누락·중복 없는 연속 seq, 중복 ack, 비참여자 거절 |
+| `WebSocketIntegrationTest` | 3 | 끊김 → 재연결 resume 시 누락·중복 없는 연속 seq, 중복 ack / 비정상 끊김 → DISCONNECT·`INTERRUPTED` → 재연결 → RECONNECT·`ACTIVE` (원장 순서, 시점 복원 결과까지) / 비참여자 거절 |
 
 ### 장애 주입 / 부하 테스트
 
@@ -104,7 +104,7 @@ k6 run loadtest/read-paths.js                              # timeline / messages
 | 부하 테스트 / 성능 측정 | k6 2종, 병목 진단 → 5단계 개선 기록 ([결과](docs/load-test-results.md)) |
 | 운영 대시보드 | Grafana 자동 프로비저닝 대시보드 15패널, 도메인 메트릭 20종 |
 | 관측 가능성 | JSON 구조화 로그, traceId (HTTP 자동 + WS 프레임별 span + Redis 메시지 전파) |
-| 테스트 고도화 | 단위 73 + Testcontainers 통합 16, 결정성 property 테스트, 장애 주입 스크립트 3종 + chaos API |
+| 테스트 고도화 | 단위 73 + Testcontainers 통합 17, 결정성 property 테스트, 장애 주입 스크립트 3종 + chaos API |
 | 추가 통신 방식 검토 | WebSocket/SSE/Long Polling/WebRTC 비교 + WebRTC 공존 설계 (문서) |
 | 기타 | 브라우저 테스트 클라이언트 (`/`, 입력 중 표시는 상태가 바뀔 때만 전송: 입력 시작·삭제 시작·전송), 세션 생성 `Idempotency-Key`, 정합성 점검 SQL |
 

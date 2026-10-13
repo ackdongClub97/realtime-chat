@@ -2,7 +2,9 @@
 //   node scripts/chaos/db-pause.mjs
 //
 // 기대 동작
-//  - append 실패 시 서버는 재시도 가능한 오류(DB_UNAVAILABLE, retryable=true)를 빠르게 반환 (connection-timeout 3s)
+//  - append 실패 시 서버는 재시도 가능한 오류(DB_UNAVAILABLE, retryable=true)를 약 5초 후 반환
+//    (이미 풀에 있는 커넥션의 쿼리가 응답을 못 받으므로 JDBC socketTimeout=5s 가 적용된다.
+//     Hikari connection-timeout=3s 는 풀이 고갈돼 커넥션을 기다릴 때만 적용된다)
 //  - 클라이언트는 같은 clientEventId 로 재전송 → DB 복구 후 정확히 한 번만 저장
 import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';

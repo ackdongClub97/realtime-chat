@@ -95,6 +95,10 @@ flowchart LR
 | `seq == lastSentSeq + 1` | 보내고, 보관 중인 후속 이벤트를 이어서 보낸다 |
 | `seq > lastSentSeq + 1` | 재정렬 버퍼에 보관하고 200ms 대기한다. 그래도 빈 seq가 없으면 원장에서 채운다(gap-fill) |
 
+**조용한 대화의 유실:** gap-fill은 다음 이벤트가 와야 동작하므로, 마지막 이벤트가 Redis에서 유실되면 위 불변식만으로는 발견하지 못한다. 그래서 `ping`마다 서버가 원장의 최신 seq와 그 연결의 `lastSentSeq`를 비교해 빠진 이벤트를 먼저 보내고 `pong{serverLastSeq}`로 답한다(`silentlyLostLastEventIsRecoveredOnPingWithoutNewEvents`, `redis-down.mjs`).
+
+**잘못된 `lastSeq`:** 숫자가 아니거나 음수면 close 4400, 서버의 최신 seq보다 크면 close 4422로 거절한다. 조용히 낮춰 받으면 클라이언트가 그 사이 이벤트를 "이미 받음"으로 버려 유실된다.
+
 **결과:** 클라이언트는 resume 도중이든, Redis가 메시지를 잃든, 인스턴스가 바뀌든 **gap 없고 중복 없는 순서대로의 스트림**을 받는다. 부하 테스트 11만 건과 장애 주입 3종에서 `seq_gap = 0`이었다.
 
 **연결 상태 이벤트**

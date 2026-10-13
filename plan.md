@@ -4,7 +4,7 @@
 
 이 문서는 전체 설계를 한곳에 요약한다. 절마다 상세 문서를 링크했다.
 
-> 문서 기준: 2026-10-13, 코드 커밋 `a59252f`. 실행 방법과 테스트 목록은 [README.md](README.md)에 있다.
+> 문서 기준: 2026-10-13. 실행 방법과 테스트 목록은 [README.md](README.md)에 있다.
 
 ---
 
@@ -52,7 +52,7 @@
 | 3 | **순서 역전은 서버가 거절하고 클라이언트가 재시도** | 원본보다 먼저 온 수정은 422 retryable. 원장에는 인과 순서가 지켜진 이벤트만 존재한다 | 클라이언트가 재시도 규칙을 지켜야 한다 |
 | 4 | **실시간 팬아웃은 at-most-once (Redis), 정합성은 원장이 책임** | 유실은 재정렬 버퍼 → gap-fill → resume으로 원장에서 복구한다. 그래서 Kafka 없이 충분하다 | Redis 장애 시 다른 인스턴스 사용자는 복구까지 실시간 수신이 지연된다 |
 | 5 | **Transactional Outbox** | 이벤트 저장과 비동기 작업 등록을 한 트랜잭션으로 묶어 부분 실패를 없앤다 | DB 폴링 비용 |
-| 6 | **스냅샷은 정확한 경계(seq % 100 == 0)에서** | 어떤 시점이든 리플레이가 최대 99건으로 상한이 정해진다 | 스냅샷 저장 공간 |
+| 6 | **스냅샷은 정확한 경계(seq % 100 == 0)에서** | 스냅샷 생성이 따라잡은 경우 어떤 시점이든 리플레이가 최대 99건이다 | 스냅샷 저장 공간. 생성이 비동기라 지연 시 리플레이가 길어진다(정확성은 유지) |
 | 7 | **Reducer는 순수 함수** | 같은 이벤트 → 항상 같은 상태. 스냅샷 경로와 전체 리플레이를 언제든 대조할 수 있다(`verify=true`) | 시각·난수·DB를 reducer 안에서 쓸 수 없다 |
 | 8 | **성능보다 정합성** | `synchronous_commit=off` 같은 지연 개선책은 ack 후 유실 가능성 때문에 채택하지 않았다 | 쓰기 처리량 상한이 DB commit 속도로 정해진다 |
 
@@ -192,6 +192,10 @@ DISCONNECTED   --RECONNECT-->   JOINED
 | `== lastSentSeq + 1` | 전송, 보관 중인 후속 이벤트도 이어서 전송 |
 | `> lastSentSeq + 1` | 재정렬 버퍼에 보관 후 200ms 대기, 그래도 비면 원장에서 채움(gap-fill) |
 
+gap-fill은 다음 이벤트가 와야 동작한다. 그래서 조용한 대화에서 **마지막 이벤트**가 유실되면 발견할 수 없다. 이를 위해 클라이언트는 주기적으로 `ping`을 보내고, 서버는 ping마다 원장의 최신 seq와 그 연결에 보낸 seq를 비교해 빠진 이벤트를 먼저 보낸 뒤 `pong{serverLastSeq}`로 답한다.
+
+재연결 시 `lastSeq`가 숫자가 아니거나 음수면 close 4400, 서버의 최신 seq보다 크면(다른 세션의 상태, 원장 롤백) close 4422로 거절한다. 조용히 낮춰 받으면 클라이언트가 그 사이 이벤트를 "이미 받음"으로 버려 유실되기 때문이다.
+
 결과적으로 클라이언트는 resume 중이든, Redis가 메시지를 잃든, 인스턴스가 바뀌든 **구멍과 중복이 없는 seq 순 스트림**을 받는다.
 
 ### 5.4 Presence
@@ -209,7 +213,7 @@ cutoffSeq --(PK 역방향 1건)--> seq ≤ cutoffSeq 인 가장 최근 스냅샷
 ```
 
 - **복원 대상:** 세션 상태, 참여자(입장·퇴장·끊김), 메시지(전송·수정·삭제 반영), 참여자별 읽음 포인터와 안 읽은 수.
-- **스냅샷:** seq가 100의 배수가 될 때마다 정확히 그 seq에서, 그리고 세션 종료 시 생성한다. 리플레이는 최대 99건이다. 스냅샷은 JSONB + `schema_version`이라 구조가 바뀌면 원장에서 다시 만들어진다.
+- **스냅샷:** seq가 100의 배수가 될 때마다 정확히 그 seq에서, 그리고 세션 종료 시 생성한다. 리플레이 최대 99건은 스냅샷 생성(비동기 워커)이 이벤트를 따라잡은 경우의 성능 특성이다. 워커가 밀리거나 세션이 DLQ에 걸려 스냅샷이 늦어지면 리플레이가 길어질 뿐, 복원은 원장을 직접 리플레이하므로 결과는 정확하다(`chat_restore_replayed_events`로 감시). 스냅샷은 projection과 같은 워커·트랜잭션에서 만들어지므로, 세션이 DLQ에 걸리면 그 세션의 스냅샷 생성도 멈춘다. 스냅샷은 JSONB + `schema_version`이라 구조가 바뀌면 원장에서 다시 만들어진다.
 - **결정성:** reducer는 seq 순으로만 적용하고, 이미 반영한 seq는 무시하며, seq에 구멍이 있으면 예외를 던진다. 잘못된 결과를 그럴듯하게 만들지 않는다.
 - **검증:** `verify=true`이면 스냅샷 없이 처음부터 리플레이한 결과와 비교해 `verifiedAgainstFullReplay`를 돌려준다.
 - **삭제된 메시지:** 복원은 그 시점 화면을 재현한다. 삭제 이전 시점이면 원문, 이후면 `DELETED`(`text: null`)다. 원문은 원장에 남는다. 완전 삭제가 필요하면 crypto-shredding을 쓴다(비목표).
@@ -294,7 +298,7 @@ cutoffSeq --(PK 역방향 1건)--> seq ≤ cutoffSeq 인 가장 최근 스냅샷
 | 장애 | 감지 | 완화 / 복구 |
 |---|---|---|
 | 서버 인스턴스 다운 | 하트비트 TTL 만료 + sweeper (최대 약 25초) | 다른 인스턴스로 재연결, `lastSeq` resume으로 누락·중복 없이 복구 |
-| Redis 중단 | 버스 발행 실패 메트릭 | 저장은 정상. 복구 후 gap-fill로 자동 보충 |
+| Redis 중단 | 버스 발행 실패 메트릭 | 저장은 정상. 다른 인스턴스 사용자는 ping 주기 안에 원장에서 누락분을 받고, Redis 복구 후 실시간 전달 재개 |
 | DB 응답 없음 | JDBC `socketTimeout=5s` | 5초 후 retryable 오류 → 클라이언트가 같은 ID로 재시도, 1건만 저장 |
 | 커넥션 고갈 | Hikari `connection-timeout=3s`, pending 메트릭 | 빠르게 실패 → 재시도 |
 | 정합성 이슈 | 정합성 점검 SQL, `verify=true` | projection 재구축, 스냅샷 재생성 |
@@ -318,13 +322,13 @@ cutoffSeq --(PK 역방향 1건)--> seq ≤ cutoffSeq 인 가장 최근 스냅샷
 | 수준 | 내용 | 결과 |
 |---|---|---|
 | 단위 테스트 73개 | reducer 결정성(무작위 순서 + 중복 200회 → 항상 같은 상태, 모든 지점에서 스냅샷+리플레이 == 전체 리플레이), 상태 머신 전 조합, 멱등성·검증 규칙, 전송 재정렬·gap-fill, outbox 백오프·DLQ | 통과 |
-| 통합 테스트 17개 (Testcontainers) | 32 스레드 동시 재전송 → 1건 저장, 200건 동시 append → seq gap-free, 시점 복원 API, 스냅샷 경계, poison → DLQ → requeue, WS resume, 끊김 → 재연결 상태 전이 | 통과 |
-| 시나리오 스크립트 | `smoke.sh` (REST), `ws-scenario.mjs` (서로 다른 인스턴스 간 19개 검사) | 통과 |
+| 통합 테스트 23개 (Testcontainers) | 32 스레드 동시 재전송 → 1건 저장, 200건 동시 append → seq gap-free, 거절·NOOP·중복 이벤트의 seq 미소비(실제 DB 롤백), 조용한 유실의 ping 복구, `lastSeq` 검증, 시점 복원 API, 스냅샷 경계, poison → DLQ → requeue, WS resume, 끊김 → 재연결 상태 전이 | 통과 |
+| 시나리오 스크립트 | `smoke.sh` (REST), `ws-scenario.mjs` (서로 다른 인스턴스 간 22개 검사) | 통과 |
 | 장애 주입 3종 | 인스턴스 SIGKILL, Redis 중단, DB 일시 정지 | 통과 |
 | 부하 테스트 (k6) | WS 500명 초당 ~1,000건: ack p95 5~9ms(워밍업 후), seq_gap 0. 포화(초당 ~1,850건)에서도 정합성 유지 | [load-test-results.md](docs/load-test-results.md) |
 
 ```bash
-./gradlew test                          # 단위 73 + 통합 17 = 90개
+./gradlew test                          # 단위 73 + 통합 23 = 96개
 docker compose up -d --build
 ./scripts/smoke.sh
 A=http://localhost:8081 B=http://localhost:8082 node scripts/ws-scenario.mjs
@@ -340,7 +344,7 @@ node scripts/chaos/instance-down.mjs    # redis-down.mjs, db-pause.mjs
 | 세션 단위 쓰기 직렬화 | 한 세션의 쓰기 처리량 상한 | 1:1 대화에선 충분. 그룹 채팅이라면 세션 분할 |
 | 단일 PostgreSQL 쓰기 | 초당 약 1,850건에서 포화 | `session_id` 해시 샤딩 |
 | 스냅샷이 전체 메시지 맵을 포함 | 메시지 수만 건 세션은 복원 시 역직렬화 비용 증가 (5,000건에 약 13ms) | 메시지 상태를 스냅샷에서 분리 ([db-design.md §5](docs/db-design.md)) |
-| 인증 없음 | 세션 ID만 알면 원장·복원 조회 가능 | 인증 도입, 원장 조회와 삭제 이전 시점 복원은 감사 권한으로 제한 |
+| 인증 없음 (개발·검증 전용 구성) | 세션 ID만 알면 원장·복원 조회 가능. 관리자 API, Grafana도 인증 없음 | 인증 도입, 원장 조회와 삭제 이전 시점 복원은 감사 권한으로 제한, 관리 도구는 내부망 전용 ([README 보안 주의](README.md)) |
 | 삭제된 원문이 원장에 남음 | 개인정보 삭제 요청에 대응 불가 | crypto-shredding ([event-sourcing.md §3](docs/event-sourcing.md)) |
 | 인스턴스 장애 감지 최대 약 25초 | 그동안 상대방은 끊김을 모름 | 하트비트 TTL·sweep 주기 단축 (오탐과 트레이드오프) |
 

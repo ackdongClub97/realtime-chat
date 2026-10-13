@@ -6,7 +6,7 @@
 |---|---|
 | `sessionId` | 세션 ID (필수) |
 | `userId` | 사용자 ID (필수). 인증은 과제 비목표라 쿼리로 받는다. 운영에서는 핸드셰이크 시 토큰 검증으로 대체한다 |
-| `lastSeq` | 클라이언트가 이미 가진 마지막 seq. 지정하면 그 이후 이벤트를 먼저 재전송(resume)한 뒤 live로 전환한다. 생략하면 현재 시점부터 live만 받는다 (이력은 REST `GET /messages`로 조회). `0`이면 처음부터 받는다 |
+| `lastSeq` | 클라이언트가 이미 가진 마지막 seq. 지정하면 그 이후 이벤트를 먼저 재전송(resume)한 뒤 live로 전환한다. 생략하면 현재 시점부터 live만 받는다 (이력은 REST `GET /messages`로 조회). `0`이면 처음부터 받는다. 음수·숫자가 아니면 close `4400`, 서버의 최신 seq보다 크면 close `4422`로 거절한다 |
 
 연결 전에 `POST /sessions/{id}/join`으로 참여해 있어야 한다.
 
@@ -25,7 +25,7 @@
 // 명시적 퇴장 (LEAVE 이벤트 기록 후 연결 종료)
 { "type": "leave" }
 
-// 하트비트 (presence TTL 갱신)
+// 하트비트. presence TTL 을 갱신하고, 서버가 원장의 최신 seq 와 비교해 빠진 이벤트를 먼저 보낸 뒤 pong 으로 답한다
 { "type": "ping" }
 ```
 
@@ -57,14 +57,14 @@
 // 휘발성 신호
 { "type": "presence", "userId": "bob", "status": "ONLINE" }   // ONLINE | OFFLINE
 { "type": "typing", "userId": "alice", "typing": true }
-{ "type": "pong", "serverLastSeq": 58 }
+{ "type": "pong", "serverLastSeq": 58 }   // 원장의 최신 seq. 이 값까지의 이벤트는 pong 보다 먼저 전송된다
 ```
 
 ### 주요 오류 코드
 
 | code | 의미 | 클라이언트 행동 |
 |---|---|---|
-| `TARGET_NOT_FOUND` | 수정/삭제 대상 메시지가 아직 없음 (순서 뒤바뀜) | 원본의 ack를 받은 뒤 **같은 clientEventId**로 재시도 |
+| `TARGET_NOT_FOUND` | 수정/삭제 대상 메시지가 아직 없음 (순서 뒤바뀜) | 원본의 ack를 받은 뒤 **같은 clientEventId**로 재시도. 원본을 보낸 적이 없거나 원본이 거절됐다면 재시도하지 않는다 (아래 규칙 5) |
 | `DB_UNAVAILABLE` | DB 장애 / 타임아웃 | 백오프 후 **같은 clientEventId**로 재시도 |
 | `IDEMPOTENCY_KEY_REUSED` | 같은 clientEventId로 다른 내용을 보냄 | 클라이언트 버그. 새 ID를 발급 |
 | `NOT_PARTICIPANT` / `NOT_MESSAGE_OWNER` | 권한 없음 | 재시도하지 않음 |
@@ -76,7 +76,8 @@
 |---|---|
 | 4000 | 세션 종료 |
 | 4001 | 같은 사용자의 새 연결로 교체됨 (사용자당 세션 연결 1개) |
-| 4400 / 4403 / 4404 / 4409 | 잘못된 파라미터 / 참여자 아님 / 세션 없음 / 종료된 세션 |
+| 4400 / 4403 / 4404 / 4409 | 잘못된 파라미터(`lastSeq` 형식 포함) / 참여자 아님 / 세션 없음 / 종료된 세션 |
+| 4422 | `lastSeq`가 서버의 최신 seq보다 큼 (다른 세션의 상태, 서버 원장 롤백) → 로컬 상태를 버리고 `lastSeq=0`으로 다시 연결 |
 | 1000 | 정상 종료 (`leave` 후) |
 | 1011 / 1006 | 서버 오류 / 비정상 단절 → `lastSeq`로 재연결 |
 
@@ -88,5 +89,8 @@
    - `seq > lastSeq + 1`이면 `resume`을 보낸다. 서버도 연결별로 gap-fill을 하므로 정상 상황에서는 발생하지 않는다.
 3. **재연결할 때는 마지막으로 받은 `seq`를 `lastSeq`로 넘긴다.**
 4. 화면 표시 시각은 `serverReceivedAt`을 쓴다. `clientTs`는 기기 시계라 신뢰하지 않는다.
+5. **재시도에는 상한을 둔다.** `TARGET_NOT_FOUND`는 원본의 ack를 받은 뒤에만, 최대 3회까지 백오프하며 재시도한다. 원본이 거절됐거나 상한을 넘으면 그 수정/삭제를 실패로 사용자에게 알리고 버린다. 새 `clientEventId`로 바꿔 보내지 않는다.
+6. **주기적으로 `ping`을 보낸다** (참고 구현: Node 10초, 브라우저 5초). gap-fill은 다음 이벤트가 와야 동작하므로, 조용한 대화에서 마지막 이벤트가 유실되면 ping이 유일한 감지 경로다. 서버는 ping마다 원장과 비교해 빠진 이벤트를 먼저 보낸다. 그래도 `pong.serverLastSeq > lastSeq`이면 `resume`을 보낸다.
+7. **세션을 바꾸면 `lastSeq`와 받은 이벤트를 버린다.** 다른 세션의 `lastSeq`로 연결하면 새 세션의 이벤트를 "이미 받음"으로 버리게 된다. close `4422`를 받아도 같은 처리를 한다.
 
 참고 구현: [`scripts/lib/chat-client.mjs`](../scripts/lib/chat-client.mjs)

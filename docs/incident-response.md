@@ -5,7 +5,7 @@
 | 시나리오 | 재현 | 결과 |
 |---|---|---|
 | 서버 인스턴스 강제 종료 | `node scripts/chaos/instance-down.mjs` | 감지 21.8~23.5s (3회), resume 누락/중복 0 |
-| Redis 중단 | `node scripts/chaos/redis-down.mjs` | 저장 정상, 복구 후 gap-fill로 자동 보충 |
+| Redis 중단 | `node scripts/chaos/redis-down.mjs` | 저장 정상, 새 메시지 없이 ping으로 누락 복구, Redis 복구 후 실시간 재개 |
 | DB 응답 없음 | `node scripts/chaos/db-pause.mjs` | 5.0s 후 retryable 오류, 재시도 후 1건만 저장 |
 | projection 실패 (poison) | `PUT /admin/chaos {"poisonText":"__poison__"}` | 백오프 재시도 4회 → DLQ → requeue 후 복구 |
 

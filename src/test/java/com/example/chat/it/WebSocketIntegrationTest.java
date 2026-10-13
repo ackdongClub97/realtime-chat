@@ -16,12 +16,17 @@ import com.example.chat.ingest.EventAppendService;
 import com.example.chat.restore.RestoreService;
 import com.example.chat.restore.SessionState;
 import com.example.chat.store.EventRepository;
+import com.example.chat.store.SessionRepository;
+import com.example.chat.store.SessionRow;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
@@ -44,6 +49,10 @@ class WebSocketIntegrationTest extends IntegrationTestBase {
     EventRepository events;
     @Autowired
     RestoreService restore;
+    @Autowired
+    SessionRepository sessionRows;
+    @Autowired
+    TransactionTemplate tx;
 
     class Recorder extends TextWebSocketHandler {
         final List<JsonNode> frames = new CopyOnWriteArrayList<>();
@@ -66,9 +75,23 @@ class WebSocketIntegrationTest extends IntegrationTestBase {
     }
 
     private WebSocketSession connect(Recorder r, UUID sid, String user, Long lastSeq) throws Exception {
+        return connectRaw(r, sid, user, lastSeq == null ? null : String.valueOf(lastSeq));
+    }
+
+    private WebSocketSession connectRaw(Recorder r, UUID sid, String user, String lastSeq) throws Exception {
         String uri = "ws://localhost:" + port + "/ws?sessionId=" + sid + "&userId=" + user
                 + (lastSeq == null ? "" : "&lastSeq=" + lastSeq);
         return new StandardWebSocketClient().execute(r, null, URI.create(uri)).get(5, TimeUnit.SECONDS);
+    }
+
+    /** 원장에는 커밋되지만 실시간 전송(커밋 후 발행)은 일어나지 않는 이벤트 = Redis 등에서 유실된 상황. */
+    private long appendWithoutPublishing(UUID sid, String clientEventId, String text) {
+        return tx.execute(status -> {
+            SessionRow row = sessionRows.lockAndAllocate(sid).orElseThrow();
+            events.insertWithOutbox(new StoredEvent(sid, row.lastSeq(), clientEventId, EventType.MESSAGE, "alice",
+                    JsonNodeFactory.instance.objectNode().put("text", text), null, null, row.lastEventAt()));
+            return row.lastSeq();
+        });
     }
 
     private void send(WebSocketSession ws, String clientEventId, String text) throws Exception {
@@ -168,6 +191,72 @@ class WebSocketIntegrationTest extends IntegrationTestBase {
     private static boolean hasEvent(Recorder r, String eventType, String userId) {
         return r.frames.stream().anyMatch(f -> "event".equals(f.path("type").asText())
                 && eventType.equals(f.path("eventType").asText()) && userId.equals(f.path("userId").asText()));
+    }
+
+    @Test
+    void silentlyLostLastEventIsRecoveredOnPingWithoutNewEvents() throws Exception {
+        UUID sid = sessions.create("alice", "ws", null).session().id();
+        appender.append(sid, new NewEvent("ja", EventType.JOIN, "alice", null, null, null), "it");
+        appender.append(sid, new NewEvent("jb", EventType.JOIN, "bob", null, null, null), "it");
+        Recorder bob = new Recorder();
+        WebSocketSession bobWs = connect(bob, sid, "bob", 0L);
+        long before = sessions.require(sid).lastSeq();
+        EventStoreIntegrationTest.await(() -> bob.eventSeqs().contains(before));
+
+        long lost = appendWithoutPublishing(sid, "lost-1", "quiet last message");
+        Thread.sleep(500); // 재정렬 대기(200ms)보다 길게: 다음 이벤트가 없으니 gap-fill 도 동작하지 않는다
+        assertThat(bob.eventSeqs()).doesNotContain(lost);
+
+        bobWs.sendMessage(new TextMessage("{\"type\":\"ping\"}"));
+        EventStoreIntegrationTest.await(() -> bob.frames.stream().anyMatch(f -> "pong".equals(f.path("type").asText())));
+
+        assertThat(bob.eventSeqs()).contains(lost);
+        List<Long> seqs = bob.eventSeqs();
+        for (int i = 1; i < seqs.size(); i++) {
+            assertThat(seqs.get(i)).isEqualTo(seqs.get(i - 1) + 1);
+        }
+        // 빠진 이벤트를 먼저 보낸 뒤 pong 을 보내므로, pong 을 받은 시점에 클라이언트는 serverLastSeq 까지 가지고 있다
+        int eventIdx = indexOf(bob, f -> "event".equals(f.path("type").asText()) && f.path("seq").asLong() == lost);
+        int pongIdx = indexOf(bob, f -> "pong".equals(f.path("type").asText()));
+        assertThat(eventIdx).isLessThan(pongIdx);
+        assertThat(bob.frames.get(pongIdx).path("serverLastSeq").asLong()).isEqualTo(lost);
+        bobWs.close();
+    }
+
+    private static int indexOf(Recorder r, java.util.function.Predicate<JsonNode> p) {
+        for (int i = 0; i < r.frames.size(); i++) {
+            if (p.test(r.frames.get(i))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    @ParameterizedTest(name = "lastSeq={0} -> close {1}")
+    @CsvSource({"abc, 4400", "-1, 4400", "FUTURE, 4422"})
+    void invalidLastSeqIsRejectedWithProtocolError(String lastSeq, int expectedCode) throws Exception {
+        UUID sid = sessions.create("alice", "ws", null).session().id();
+        appender.append(sid, new NewEvent("ja", EventType.JOIN, "alice", null, null, null), "it");
+        String param = "FUTURE".equals(lastSeq) ? String.valueOf(sessions.require(sid).lastSeq() + 5) : lastSeq;
+
+        Recorder r = new Recorder();
+        connectRaw(r, sid, "alice", param);
+        EventStoreIntegrationTest.await(() -> r.closed != null);
+        assertThat(r.closed.getCode()).isEqualTo(expectedCode);
+        assertThat(r.frames).noneMatch(f -> "welcome".equals(f.path("type").asText()));
+    }
+
+    @Test
+    void lastSeqEqualToServerLastSeqIsAccepted() throws Exception {
+        UUID sid = sessions.create("alice", "ws", null).session().id();
+        appender.append(sid, new NewEvent("ja", EventType.JOIN, "alice", null, null, null), "it");
+        long last = sessions.require(sid).lastSeq();
+        Recorder r = new Recorder();
+        WebSocketSession ws = connect(r, sid, "alice", last);
+        EventStoreIntegrationTest.await(() -> r.frames.stream().anyMatch(f -> "welcome".equals(f.path("type").asText())));
+        assertThat(r.frames.getFirst().path("resumeFrom").asLong()).isEqualTo(last);
+        assertThat(r.closed).isNull();
+        ws.close();
     }
 
     @Test

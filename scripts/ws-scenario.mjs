@@ -2,7 +2,8 @@
 //   node scripts/ws-scenario.mjs                         # 단일 인스턴스 (localhost:8080)
 //   A=http://localhost:8081 B=http://localhost:8082 node scripts/ws-scenario.mjs   # 서로 다른 인스턴스에 연결
 //
-// 검증 항목: 실시간 송수신, 중복 재전송, presence, typing, 재연결 resume, 순서 역전(수정이 원본보다 먼저), 시점 복원
+// 검증 항목: 실시간 송수신, 중복 재전송, presence, typing, 재연결 resume, 순서 역전(수정이 원본보다 먼저), 시점 복원,
+//           잘못된 lastSeq 거절(4400/4422)과 클라이언트 상태 초기화
 import { ChatClient, api, sleep, check, summary } from './lib/chat-client.mjs';
 
 const A = process.env.A ?? process.env.BASE ?? 'http://localhost:8080';
@@ -89,6 +90,24 @@ const sig = (c) => c.events.filter((e) => e.seq <= common).map((e) => `${e.seq}:
 check('alice/bob 이 같은 순서의 같은 이벤트를 받음', alice.isContiguous() && sig(alice) === sig(bob),
   `common=${common}`);
 
-await alice.close();
+console.log('8) 잘못된 lastSeq: 다른 세션의 상태로 재연결');
 await bob.close();
+const bobBad = new ChatClient({ base: B, sessionId: sid, userId: 'bob', pingMs: 0 });
+const badFormat = await bobBad.connect({ lastSeq: 'abc' }).then(() => null, () => bobBad.closed);
+check('숫자가 아닌 lastSeq → close 4400', badFormat?.code === 4400, `code=${badFormat?.code}`);
+bobBad.lastSeq = bob.lastSeq + 1000; // 다른(더 긴) 세션에서 가져온 lastSeq
+bobBad.events = [{ seq: bobBad.lastSeq }];
+const ahead = await bobBad.connect().then(() => null, () => bobBad.closed);
+check('서버보다 앞선 lastSeq → close 4422, 클라이언트 로컬 상태 초기화',
+  ahead?.code === 4422 && bobBad.lastSeq === null && bobBad.events.length === 0, `code=${ahead?.code}`);
+await bobBad.connect({ lastSeq: 0 });
+await sleep(500); // 재연결로 생긴 RECONNECT 이벤트까지 커밋되도록
+const { body: now } = await api(A, 'GET', `/sessions/${sid}`);
+await bobBad.waitForSeq(now.lastSeq);
+check('lastSeq=0 으로 다시 연결하면 처음부터 gap/중복 없이 서버 최신 seq 까지 수신',
+  bobBad.events[0]?.seq === 1 && bobBad.isContiguous() && bobBad.lastSeq >= now.lastSeq,
+  `seq 1..${bobBad.lastSeq}, server=${now.lastSeq}`);
+
+await alice.close();
+await bobBad.close();
 summary();

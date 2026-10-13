@@ -4,14 +4,18 @@
 //  - 이벤트마다 clientEventId(UUID) 를 붙이고, ack 를 못 받으면 "같은 id 로" 재전송한다.
 //  - 수신 이벤트는 seq 로 관리한다: seq <= lastSeq 는 버리고, 구멍이 보이면 resume 을 요청한다.
 //  - 재연결 시 lastSeq 를 넘겨 끊긴 동안의 이벤트를 받는다.
+//  - 주기적으로 ping 을 보낸다. 서버는 원장 기준으로 빠진 이벤트를 먼저 보내고 pong{serverLastSeq} 로 답한다.
+//    pong.serverLastSeq > lastSeq 이면 resume 을 요청한다 (조용한 대화에서 마지막 이벤트 유실 감지).
+//  - close 4422(lastSeq 가 서버보다 앞섬)를 받으면 로컬 상태를 버린다. 이후 lastSeq=0 으로 다시 연결한다.
 import { randomUUID } from 'node:crypto';
 
 export class ChatClient {
-  constructor({ base, sessionId, userId, log = false }) {
+  constructor({ base, sessionId, userId, log = false, pingMs = 10000 }) {
     this.base = base.replace(/^http/, 'ws');
     this.sessionId = sessionId;
     this.userId = userId;
     this.log = log;
+    this.pingMs = pingMs;
     this.lastSeq = null;
     this.events = [];        // 수신한 이벤트 (seq 순, 중복 없음)
     this.frames = [];        // 수신한 모든 프레임 (디버깅용)
@@ -36,13 +40,16 @@ export class ChatClient {
           clearTimeout(timer);
           this.connId = f.connId;
           if (this.lastSeq === null) this.lastSeq = f.resumeFrom;
+          this.startPing();
           resolve(f);
         }
         this.onFrame(f);
       };
       ws.onclose = (e) => {
         clearTimeout(timer);
+        this.stopPing();
         this.closed = { code: e.code, reason: e.reason };
+        if (e.code === 4422) this.reset();
         reject(new Error(`closed ${e.code} ${e.reason}`));
       };
       ws.onerror = () => {};
@@ -62,6 +69,10 @@ export class ChatClient {
       this.lastSeq = f.seq;
       this.events.push(f);
     }
+    if (f.type === 'pong' && this.lastSeq !== null && f.serverLastSeq > this.lastSeq) {
+      this.gapsDetected++;
+      this.raw({ type: 'resume', lastSeq: this.lastSeq });
+    }
     if (f.type === 'ack' || f.type === 'error') {
       const p = this.pending.get(f.clientEventId);
       if (p) { this.pending.delete(f.clientEventId); p.resolve(f); }
@@ -70,6 +81,18 @@ export class ChatClient {
   }
 
   raw(frame) { this.ws.send(JSON.stringify(frame)); }
+
+  startPing() {
+    this.stopPing();
+    if (!this.pingMs) return;
+    this.pingTimer = setInterval(() => { if (this.ws?.readyState === WebSocket.OPEN) this.raw({ type: 'ping' }); }, this.pingMs);
+    this.pingTimer.unref?.();
+  }
+
+  stopPing() { if (this.pingTimer) clearInterval(this.pingTimer); this.pingTimer = null; }
+
+  /** 서버와 맞지 않는 로컬 상태를 버린다 (다른 세션의 lastSeq, 서버 원장 롤백 등). */
+  reset() { this.lastSeq = null; this.events = []; }
 
   /** ack 를 받을 때까지 같은 clientEventId 로 재전송 (at-least-once + 서버 멱등 = effectively-once) */
   async send(eventType, payload, { clientEventId = randomUUID(), retries = 3, timeoutMs = 2000 } = {}) {
@@ -104,6 +127,7 @@ export class ChatClient {
   close(code = 1000) {
     return new Promise((resolve) => {
       if (!this.ws || this.ws.readyState === WebSocket.CLOSED) return resolve();
+      this.stopPing();
       this.ws.onclose = (e) => { this.closed = { code: e.code }; resolve(); };
       this.ws.close(code);
     });

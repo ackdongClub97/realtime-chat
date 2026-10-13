@@ -108,9 +108,28 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         }
 
         String lastSeqParam = q.getFirst("lastSeq");
-        long initial = lastSeqParam == null
-                ? session.lastSeq()
-                : Math.max(0, Math.min(Long.parseLong(lastSeqParam), session.lastSeq()));
+        long initial;
+        if (lastSeqParam == null) {
+            initial = session.lastSeq();
+        } else {
+            long requested;
+            try {
+                requested = Long.parseLong(lastSeqParam);
+            } catch (NumberFormatException e) {
+                requested = -1;
+            }
+            if (requested < 0) {
+                raw.close(new CloseStatus(4400, "lastSeq must be a non-negative integer"));
+                return;
+            }
+            // 서버가 발급한 적 없는 seq: 다른 세션의 상태이거나 서버 원장이 되돌려졌다. 조용히 낮추면 클라이언트가
+            // 그 사이 이벤트를 "이미 받음"으로 버려 유실되므로 거절한다. 클라이언트는 로컬 상태를 버리고 다시 연결한다.
+            if (requested > session.lastSeq()) {
+                raw.close(new CloseStatus(4422, "lastSeq ahead of server (" + session.lastSeq() + ")"));
+                return;
+            }
+            initial = requested;
+        }
 
         WebSocketSession ws = new ConcurrentWebSocketSessionDecorator(raw, SEND_TIME_LIMIT_MS, SEND_BUFFER_LIMIT_BYTES);
         ClientConnection c = new ClientConnection(sessionId, userId, ws, initial);
@@ -174,12 +193,21 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
                     c.close(CloseStatus.NORMAL);
                 }
                 case "ping" -> {
+                    // gap-fill 은 다음 이벤트가 와야 동작하므로, 조용한 대화에서 마지막 이벤트가 유실되면(Redis 등)
+                    // 발견할 수 없다. ping 마다 원장의 최신 seq 와 비교해 빠진 이벤트를 먼저 보낸 뒤 pong 을 보낸다.
+                    // presence 갱신(Redis)보다 먼저 한다: Redis 장애 시 타임아웃을 기다리지 않고 DB 만으로 복구한다.
+                    long latest = sessions.findById(c.sessionId()).map(SessionRow::lastSeq).orElse(0L);
+                    long recovered = delivery.catchUp(c, latest);
+                    if (recovered > 0) {
+                        metrics.deliveryGapFilled(recovered);
+                        log.info("missed events recovered on ping conn={} events={}", c.connId(), recovered);
+                    }
+                    sendQuietly(c, new Frames.Pong(latest));
                     try {
                         presence.refresh(c);
                     } catch (Exception e) {
                         log.debug("presence refresh failed: {}", e.getMessage());
                     }
-                    sendQuietly(c, new Frames.Pong(c.lastSentSeqSnapshot()));
                 }
                 default -> sendQuietly(c, new Frames.Error(frame.clientEventId(), "UNKNOWN_FRAME",
                         "unknown frame type: " + type, false));

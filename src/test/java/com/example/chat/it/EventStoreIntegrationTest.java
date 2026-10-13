@@ -105,6 +105,37 @@ class EventStoreIntegrationTest extends IntegrationTestBase {
     }
 
     @Test
+    void rejectedNoopAndDuplicateEventsDoNotConsumeSeq() {
+        UUID sid = newSessionWith("alice", "bob");
+        long base = sessions.require(sid).lastSeq();
+        assertThat(appender.append(sid, new NewEvent("m1", EventType.MESSAGE, "alice", text("hi"), null, null), "it")
+                .seq()).isEqualTo(base + 1);
+
+        // 각각 seq 를 발급(세션 행 UPDATE)한 뒤 거절/무시된다 → 실제 DB 트랜잭션 롤백으로 카운터가 되돌아가야 한다
+        assertThatThrownBy(() -> appender.append(sid, new NewEvent("e-early", EventType.MESSAGE_EDITED, "alice",
+                text("x").put("messageId", "nope"), null, null), "it"))
+                .extracting(e -> ((ApiException) e).code()).isEqualTo("TARGET_NOT_FOUND");
+        assertThatThrownBy(() -> appender.append(sid, new NewEvent("c1", EventType.MESSAGE, "carol", text("hi"),
+                null, null), "it"))
+                .extracting(e -> ((ApiException) e).code()).isEqualTo("NOT_PARTICIPANT");
+        assertThatThrownBy(() -> appender.append(sid, new NewEvent("r-bad", EventType.READ, "bob",
+                JsonNodeFactory.instance.objectNode().put("upToSeq", base + 99), null, null), "it"))
+                .extracting(e -> ((ApiException) e).code()).isEqualTo("INVALID_READ_POINTER");
+        assertThat(appender.append(sid, new NewEvent("j-again", EventType.JOIN, "bob", null, null, null), "it")
+                .outcome()).isEqualTo(AppendResult.Outcome.NOOP);
+        assertThat(appender.append(sid, new NewEvent("m1", EventType.MESSAGE, "alice", text("hi"), null, null), "it")
+                .outcome()).isEqualTo(AppendResult.Outcome.DUPLICATE);
+        assertThat(sessions.require(sid).lastSeq()).isEqualTo(base + 1);
+
+        assertThat(appender.append(sid, new NewEvent("m2", EventType.MESSAGE, "bob", text("yo"), null, null), "it")
+                .seq()).isEqualTo(base + 2);
+        assertThat(jdbc.queryForList("SELECT seq FROM event WHERE session_id = ? AND seq > ? ORDER BY seq",
+                Long.class, sid, base)).containsExactly(base + 1, base + 2);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM event WHERE session_id = ? AND client_event_id IN "
+                + "('e-early', 'c1', 'r-bad', 'j-again')", Long.class, sid)).isZero();
+    }
+
+    @Test
     void editArrivingBeforeOriginalIsRejectedThenAcceptedOnRetry() {
         UUID sid = newSessionWith("alice", "bob");
         NewEvent edit = new NewEvent("e1", EventType.MESSAGE_EDITED, "alice",

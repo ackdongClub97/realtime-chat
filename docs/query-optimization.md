@@ -69,7 +69,7 @@ SELECT ... FROM event WHERE session_id = $1 AND seq > $2 AND seq <= $3 ORDER BY 
 ③ Index Scan using event_pkey  (rows=49)                       Buffers: shared hit=9   Execution Time: 0.086 ms
 ```
 
-- 세 쿼리 모두 **세션 길이와 무관하게** 인덱스 몇 페이지만 읽는다. 리플레이 건수는 스냅샷 주기(100) 때문에 최대 99건이다(k6 실측 평균 50, 최대 99).
+- 세 쿼리 모두 **세션 길이와 무관하게** 인덱스 몇 페이지만 읽는다. 리플레이 건수는 스냅샷 주기(100) 때문에 최대 99건이다(k6 실측 평균 50, 최대 99). 단, 스냅샷 생성(비동기)이 따라잡은 경우다. 지연되면 리플레이가 길어질 뿐 결과는 같다.
 - `seq`와 `server_received_at`이 세션 안에서 같은 방향으로 증가하도록 발급 시 `GREATEST(clock_timestamp(), last_event_at)`를 쓴다. 덕분에 ①은 1건만 찾으면 된다. 시각과 seq가 어긋날 수 있다면 "t 이전 이벤트 집합"이 연속 구간이 아니게 되어 범위 스캔이 불가능해진다.
 
 **예상 병목과 개선 방향 (실측)**
